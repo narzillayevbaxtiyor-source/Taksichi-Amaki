@@ -29,8 +29,10 @@ ALLOWED_CHAT_ID = int((os.getenv("ALLOWED_CHAT_ID") or "0").strip() or "0")
 TAXI_TOPIC_ID = int((os.getenv("TAXI_TOPIC_ID") or "199").strip() or "199")
 STATE_FILE = (os.getenv("STATE_FILE") or "state.json").strip()
 
+# Reminder interval (default 10 minutes)
 REMIND_EVERY_MIN_DEFAULT = int((os.getenv("REMIND_EVERY_MIN") or "10").strip() or "10")
 
+# Admin IDs: "123,456" (optional)
 ADMIN_IDS_RAW = (os.getenv("ADMIN_IDS") or "").strip()
 ADMIN_IDS = set()
 if ADMIN_IDS_RAW:
@@ -83,6 +85,18 @@ def set_remind_every_min(minutes: int) -> None:
     STATE["settings"]["remind_every_sec"] = minutes * 60
     save_state(STATE)
 
+def get_default_price_text() -> str:
+    # ✅ default: Kelishilgan narxda
+    return (STATE["settings"].get("default_price_text") or "Kelishilgan narxda").strip() or "Kelishilgan narxda"
+
+def set_default_price_text(text: str) -> None:
+    text = (text or "").strip() or "Kelishilgan narxda"
+    STATE["settings"]["default_price_text"] = text
+    save_state(STATE)
+
+def now_ts() -> int:
+    return int(time.time())
+
 def new_order_id() -> str:
     return str(int(time.time() * 1000))
 
@@ -108,6 +122,7 @@ class Order:
     phone: str = ""
     username_confirm: str = ""
 
+    # Price line
     price_text: str = "Kelishilgan narxda"
 
     status: str = "pending"     # pending -> posted -> assigned -> cancelled
@@ -313,6 +328,173 @@ def kb_when() -> ReplyKeyboardMarkup:
         one_time_keyboard=True,
     )
 
+# ================== ADMIN PANEL (NEW) ==================
+def admin_menu_text() -> str:
+    cur_int = get_remind_every_sec() // 60
+    cur_price = get_default_price_text()
+    return (
+        "🛠 ADMIN PANEL\n\n"
+        f"⏱ Interval: {cur_int} daqiqa\n"
+        f"💰 Default narx: {cur_price}\n\n"
+        "Tanlang:"
+    )
+
+def admin_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏱ Interval", callback_data="adm:interval")],
+        [InlineKeyboardButton("💰 Default narx", callback_data="adm:price")],
+        [InlineKeyboardButton("📋 Aktiv buyurtmalar", callback_data="adm:orders")],
+    ])
+
+def interval_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("5m", callback_data="adm:setint:5"),
+            InlineKeyboardButton("10m", callback_data="adm:setint:10"),
+            InlineKeyboardButton("15m", callback_data="adm:setint:15"),
+            InlineKeyboardButton("30m", callback_data="adm:setint:30"),
+        ],
+        [InlineKeyboardButton("⬅️ Orqaga", callback_data="adm:menu")],
+    ])
+
+def price_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Kelishilgan narxda", callback_data="adm:setprice:Kelishilgan narxda")],
+        [InlineKeyboardButton("20 SAR", callback_data="adm:setprice:20 SAR"),
+         InlineKeyboardButton("30 SAR", callback_data="adm:setprice:30 SAR")],
+        [InlineKeyboardButton("⬅️ Orqaga", callback_data="adm:menu")],
+    ])
+
+def active_orders_list() -> List[Order]:
+    items = []
+    for oid, data in (STATE.get("orders", {}) or {}).items():
+        st = data.get("status")
+        if st in ("posted", "assigned"):
+            try:
+                items.append(Order(**data))
+            except Exception:
+                pass
+    # newest first
+    items.sort(key=lambda x: x.order_id, reverse=True)
+    return items[:10]
+
+def orders_kb(orders: List[Order]) -> InlineKeyboardMarkup:
+    rows = []
+    for o in orders:
+        rows.append([InlineKeyboardButton(f"🆔 {o.order_id} ({o.status})", callback_data=f"adm:order:{o.order_id}")])
+    rows.append([InlineKeyboardButton("⬅️ Orqaga", callback_data="adm:menu")])
+    return InlineKeyboardMarkup(rows)
+
+def order_admin_kb(order_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔁 Hozir qayta e’lon", callback_data=f"adm:repost:{order_id}")],
+        [InlineKeyboardButton("❌ Admin bekor qilsin", callback_data=f"adm:cancel:{order_id}")],
+        [InlineKeyboardButton("⬅️ Orqaga", callback_data="adm:orders")],
+    ])
+
+async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_chat or update.effective_chat.type != ChatType.PRIVATE:
+        return
+    uid = update.effective_user.id if update.effective_user else 0
+    if not is_admin(uid):
+        return
+    await update.effective_message.reply_text(admin_menu_text(), reply_markup=admin_menu_kb())
+
+async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q or not q.data:
+        return
+    uid = q.from_user.id if q.from_user else 0
+    if not is_admin(uid):
+        await q.answer()
+        return
+
+    await q.answer()
+    data = q.data
+
+    if data == "adm:menu":
+        await q.edit_message_text(admin_menu_text(), reply_markup=admin_menu_kb())
+        return
+
+    if data == "adm:interval":
+        await q.edit_message_text("⏱ Intervalni tanlang:", reply_markup=interval_kb())
+        return
+
+    if data.startswith("adm:setint:"):
+        mins = int(data.split(":", 2)[2])
+        set_remind_every_min(mins)
+        reschedule_all_posted(context.application)
+        await q.edit_message_text(f"✅ Interval {mins} daqiqaga o‘zgardi.", reply_markup=admin_menu_kb())
+        return
+
+    if data == "adm:price":
+        await q.edit_message_text("💰 Default narxni tanlang:", reply_markup=price_kb())
+        return
+
+    if data.startswith("adm:setprice:"):
+        txt = data.split(":", 2)[2]
+        set_default_price_text(txt)
+        await q.edit_message_text(f"✅ Default narx: {get_default_price_text()}", reply_markup=admin_menu_kb())
+        return
+
+    if data == "adm:orders":
+        orders = active_orders_list()
+        if not orders:
+            await q.edit_message_text("Hozir aktiv buyurtma yo‘q.", reply_markup=admin_menu_kb())
+            return
+        await q.edit_message_text("📋 Aktiv buyurtmalar:", reply_markup=orders_kb(orders))
+        return
+
+    if data.startswith("adm:order:"):
+        order_id = data.split(":", 2)[2]
+        o = load_order(order_id)
+        if not o:
+            await q.edit_message_text("Order topilmadi.", reply_markup=admin_menu_kb())
+            return
+        await q.edit_message_text(order_card_text(o), reply_markup=order_admin_kb(order_id), disable_web_page_preview=True)
+        return
+
+    if data.startswith("adm:repost:"):
+        order_id = data.split(":", 2)[2]
+        o = load_order(order_id)
+        if not o or o.status != "posted":
+            await q.edit_message_text("Bu order repost uchun aktiv emas (posted bo‘lishi kerak).", reply_markup=admin_menu_kb())
+            return
+        try:
+            mid = await post_order_to_group(context, o, delete_old=True)
+            o.group_message_id = mid
+            update_order(o)
+        except Exception:
+            log.exception("admin repost failed")
+        schedule_reminder(context.application, o.order_id)
+        await q.edit_message_text("✅ Qayta e’lon qilindi.", reply_markup=admin_menu_kb())
+        return
+
+    if data.startswith("adm:cancel:"):
+        order_id = data.split(":", 2)[2]
+        o = load_order(order_id)
+        if not o:
+            await q.edit_message_text("Order topilmadi.", reply_markup=admin_menu_kb())
+            return
+        o.status = "cancelled"
+        update_order(o)
+        if context.job_queue:
+            delete_job(context.job_queue, remind_job_name(order_id))
+        try:
+            if o.group_message_id:
+                await context.bot.edit_message_text(
+                    chat_id=ALLOWED_CHAT_ID,
+                    message_id=o.group_message_id,
+                    message_thread_id=TAXI_TOPIC_ID,
+                    text=order_card_text(o),
+                    reply_markup=order_keyboard(o),
+                    disable_web_page_preview=True,
+                )
+        except Exception:
+            pass
+        await q.edit_message_text("✅ Admin buyurtmani bekor qildi.", reply_markup=admin_menu_kb())
+        return
+
 # ================== COMMANDS ==================
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat and update.effective_chat.type == ChatType.PRIVATE:
@@ -349,7 +531,6 @@ async def taxi_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not chat:
         return
 
-    # ===== GROUP/SUPERGROUP =====
     if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
         if not is_allowed_group(update):
             return
@@ -357,15 +538,17 @@ async def taxi_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if current_tid != TAXI_TOPIC_ID:
             return  # JIM
 
+        bot_username = context.bot.username
+        bot_link = f"https://t.me/{bot_username}?start=1"
+
         await update.effective_message.reply_text(
             "Taksi buyurtma berish uchun botga shaxsiy chatda yozing:\n"
             "1) Bot profiliga kiring\n"
-            "2) Start bosing\n"
-            "3) /taksi yozing"
+            f"2) Start bosing 👇\n{bot_link}",
+            disable_web_page_preview=True,
         )
         return
 
-    # ===== PRIVATE =====
     if chat.type == ChatType.PRIVATE:
         uid = update.effective_user.id
 
@@ -389,7 +572,7 @@ async def taxi_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             when="",
             phone="",
             username_confirm=username or "",
-            price_text="Kelishilgan narxda",
+            price_text=get_default_price_text(),   # ✅ admin panel default narxi shu yerda ishlaydi
             status="pending",
         )
         store_order(o)
@@ -401,7 +584,7 @@ async def taxi_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb_request_location(),
         )
 
-# ================== ADMIN COMMANDS ==================
+# ================== ADMIN COMMANDS (OLD) ==================
 async def setinterval_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id if update.effective_user else 0
     if not is_admin(uid):
@@ -649,6 +832,7 @@ async def reminder_tick(context: ContextTypes.DEFAULT_TYPE):
         delete_job(context.job_queue, remind_job_name(order_id))
         return
 
+    # ✅ cancelled/assigned bo'lsa — reminder STOP
     if o.status != "posted":
         delete_job(context.job_queue, remind_job_name(order_id))
         return
@@ -665,31 +849,25 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q or not q.data:
         return
+    await q.answer()
 
-    # Faqat allowed group + taxi topic ichida ishlasin
+    # faqat allowed group + taxi topic ichida ishlasin
     if not q.message or not q.message.chat:
-        await q.answer()
         return
     if q.message.chat.id != ALLOWED_CHAT_ID:
-        await q.answer()
         return
     if getattr(q.message, "message_thread_id", None) != TAXI_TOPIC_ID:
-        await q.answer()
         return
 
-    # callback format tekshirish
     if ":" not in q.data:
-        await q.answer()
         return
 
     action, order_id = q.data.split(":", 1)
-
     o = load_order(order_id)
     if not o:
         await q.answer("Buyurtma topilmadi.", show_alert=True)
         return
 
-    # ========== CUSTOMER CANCEL ==========
     if action == "cancel":
         if q.from_user.id != o.user_id:
             await q.answer("Bekor qilish faqat buyurtmachiga mumkin.", show_alert=True)
@@ -703,8 +881,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         o.status = "cancelled"
         update_order(o)
-        if context.job_queue:
-            delete_job(context.job_queue, remind_job_name(order_id))
+        delete_job(context.job_queue, remind_job_name(order_id))
 
         try:
             if o.group_message_id:
@@ -727,7 +904,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer("Bekor qilindi.")
         return
 
-    # ========== ACCEPT ==========
     if action == "accept":
         if o.status != "posted":
             await q.answer("Bu buyurtma endi aktiv emas.", show_alert=True)
@@ -739,8 +915,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         o.driver_username = f"@{q.from_user.username}" if q.from_user.username else ""
         update_order(o)
 
-        if context.job_queue:
-            delete_job(context.job_queue, remind_job_name(order_id))
+        delete_job(context.job_queue, remind_job_name(order_id))
 
         try:
             if o.group_message_id:
@@ -768,32 +943,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-        try:
-            passenger_disp = o.username_confirm or o.user_username or o.user_name
-            lines = [
-                "✅ Siz buyurtmani qabul qildingiz.",
-                f"👤 Mijoz: {passenger_disp}",
-                f"💰 Narx: {o.price_text or 'Kelishilgan narxda'}",
-            ]
-            if o.phone:
-                lines.append(f"📞 Telefon: {o.phone}")
-            if o.pickup_lat is not None and o.pickup_lon is not None:
-                lines.append(f"📍 Pickup: {maps_link(o.pickup_lat, o.pickup_lon)}")
-            lines.append(f"📍 Qayerdan: {o.pickup_text}")
-            if o.drop_lat is not None and o.drop_lon is not None:
-                lines.append(f"🏁 Dropoff: {maps_link(o.drop_lat, o.drop_lon)}")
-            lines.append(f"🏁 Qayerga: {o.drop_text}")
-            lines.append(f"👥 Odamlar: {o.people}")
-            lines.append(f"⏰ Vaqt: {o.when}")
-
-            await context.bot.send_message(chat_id=o.driver_id, text="\n".join(lines))
-        except Exception:
-            pass
-
         await q.answer("Qabul qilindi ✅")
         return
 
-    # ========== DRIVER CANCEL (REPOST IMMEDIATELY) ==========
     if action == "driver_cancel":
         uid = q.from_user.id
         if not (uid == (o.driver_id or -1) or is_admin(uid)):
@@ -832,12 +984,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer("Qayta e’lon qilindi ✅")
         return
 
-    if action == "noop":
-        await q.answer("Bu buyurtma band.", show_alert=False)
-        return
-
-    await q.answer()
-
 # ================== MAIN ==================
 async def on_startup(app: Application):
     reschedule_all_posted(app)
@@ -851,6 +997,10 @@ def main():
 
     app.add_handler(CommandHandler("setinterval", setinterval_cmd))
     app.add_handler(CommandHandler("setprice", setprice_cmd))
+
+    # ✅ ADMIN PANEL handlers
+    app.add_handler(CommandHandler("admin", admin_cmd))
+    app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^adm:"))
 
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & (filters.TEXT | filters.LOCATION | filters.CONTACT), private_router))
     app.add_handler(CallbackQueryHandler(on_callback))
