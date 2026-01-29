@@ -29,10 +29,8 @@ ALLOWED_CHAT_ID = int((os.getenv("ALLOWED_CHAT_ID") or "0").strip() or "0")
 TAXI_TOPIC_ID = int((os.getenv("TAXI_TOPIC_ID") or "199").strip() or "199")
 STATE_FILE = (os.getenv("STATE_FILE") or "state.json").strip()
 
-# Reminder interval (default 10 minutes)
 REMIND_EVERY_MIN_DEFAULT = int((os.getenv("REMIND_EVERY_MIN") or "10").strip() or "10")
 
-# Admin IDs: "123,456" (optional)
 ADMIN_IDS_RAW = (os.getenv("ADMIN_IDS") or "").strip()
 ADMIN_IDS = set()
 if ADMIN_IDS_RAW:
@@ -85,9 +83,6 @@ def set_remind_every_min(minutes: int) -> None:
     STATE["settings"]["remind_every_sec"] = minutes * 60
     save_state(STATE)
 
-def now_ts() -> int:
-    return int(time.time())
-
 def new_order_id() -> str:
     return str(int(time.time() * 1000))
 
@@ -113,7 +108,6 @@ class Order:
     phone: str = ""
     username_confirm: str = ""
 
-    # Price line: default
     price_text: str = "Kelishilgan narxda"
 
     status: str = "pending"     # pending -> posted -> assigned -> cancelled
@@ -131,7 +125,7 @@ def is_allowed_group(update: Update) -> bool:
 def is_admin(user_id: int) -> bool:
     return (user_id in ADMIN_IDS) if ADMIN_IDS else False
 
-def user_display(update: Update) -> (str, str):
+def user_display(update: Update) -> Tuple[str, str]:
     u = update.effective_user
     if not u:
         return ("", "")
@@ -192,7 +186,6 @@ def order_keyboard(o: Order) -> InlineKeyboardMarkup:
             [InlineKeyboardButton("❌ Bekor qilish (mijoz)", callback_data=f"cancel:{o.order_id}")],
         ])
     if o.status == "assigned":
-        # assigned holatda haydovchi bekor qilsa — qayta e'lon
         return InlineKeyboardMarkup([
             [InlineKeyboardButton("🔄 Haydovchi bekor qildi (qayta e’lon)", callback_data=f"driver_cancel:{o.order_id}")],
             [InlineKeyboardButton("✅ Band", callback_data=f"noop:{o.order_id}")],
@@ -356,6 +349,7 @@ async def taxi_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not chat:
         return
 
+    # ===== GROUP/SUPERGROUP =====
     if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
         if not is_allowed_group(update):
             return
@@ -371,6 +365,7 @@ async def taxi_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # ===== PRIVATE =====
     if chat.type == ChatType.PRIVATE:
         uid = update.effective_user.id
 
@@ -654,7 +649,6 @@ async def reminder_tick(context: ContextTypes.DEFAULT_TYPE):
         delete_job(context.job_queue, remind_job_name(order_id))
         return
 
-    # ✅ mijoz bekor qilsa (cancelled) yoki assigned bo'lsa — reminder to'xtaydi
     if o.status != "posted":
         delete_job(context.job_queue, remind_job_name(order_id))
         return
@@ -671,9 +665,25 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q or not q.data:
         return
-    await q.answer()
+
+    # Faqat allowed group + taxi topic ichida ishlasin
+    if not q.message or not q.message.chat:
+        await q.answer()
+        return
+    if q.message.chat.id != ALLOWED_CHAT_ID:
+        await q.answer()
+        return
+    if getattr(q.message, "message_thread_id", None) != TAXI_TOPIC_ID:
+        await q.answer()
+        return
+
+    # callback format tekshirish
+    if ":" not in q.data:
+        await q.answer()
+        return
 
     action, order_id = q.data.split(":", 1)
+
     o = load_order(order_id)
     if not o:
         await q.answer("Buyurtma topilmadi.", show_alert=True)
@@ -681,7 +691,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ========== CUSTOMER CANCEL ==========
     if action == "cancel":
-        # only owner
         if q.from_user.id != o.user_id:
             await q.answer("Bekor qilish faqat buyurtmachiga mumkin.", show_alert=True)
             return
@@ -692,12 +701,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer("Haydovchi biriktirilgan. Bekor qilib bo‘lmaydi.", show_alert=True)
             return
 
-        # ✅ cancel -> reminder STOP, never repost
         o.status = "cancelled"
         update_order(o)
-        delete_job(context.job_queue, remind_job_name(order_id))
+        if context.job_queue:
+            delete_job(context.job_queue, remind_job_name(order_id))
 
-        # update group message
         try:
             if o.group_message_id:
                 await context.bot.edit_message_text(
@@ -731,10 +739,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         o.driver_username = f"@{q.from_user.username}" if q.from_user.username else ""
         update_order(o)
 
-        # stop reminder
-        delete_job(context.job_queue, remind_job_name(order_id))
+        if context.job_queue:
+            delete_job(context.job_queue, remind_job_name(order_id))
 
-        # update group card
         try:
             if o.group_message_id:
                 await context.bot.edit_message_text(
@@ -748,7 +755,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-        # notify passenger
         try:
             driver_disp = o.driver_username or o.driver_name or "Haydovchi"
             await context.bot.send_message(
@@ -762,7 +768,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-        # notify driver
         try:
             passenger_disp = o.username_confirm or o.user_username or o.user_name
             lines = [
@@ -790,7 +795,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ========== DRIVER CANCEL (REPOST IMMEDIATELY) ==========
     if action == "driver_cancel":
-        # faqat shu order'ni qabul qilgan haydovchi (driver_id) yoki admin bosishi mumkin
         uid = q.from_user.id
         if not (uid == (o.driver_id or -1) or is_admin(uid)):
             await q.answer("Bu tugma faqat haydovchi yoki admin uchun.", show_alert=True)
@@ -800,14 +804,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer("Bu order hozir assigned emas.", show_alert=True)
             return
 
-        # status back to posted
         o.status = "posted"
         o.driver_id = None
         o.driver_name = ""
         o.driver_username = ""
         update_order(o)
 
-        # ✅ darhol o'chirib qayta e'lon
         try:
             mid = await post_order_to_group(context, o, delete_old=True)
             o.group_message_id = mid
@@ -817,10 +819,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer("Qayta e’lon qilishda xatolik.", show_alert=True)
             return
 
-        # ✅ reminder qayta yoqiladi
         schedule_reminder(context.application, o.order_id)
 
-        # notify passenger
         try:
             await context.bot.send_message(
                 chat_id=o.user_id,
@@ -835,6 +835,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "noop":
         await q.answer("Bu buyurtma band.", show_alert=False)
         return
+
+    await q.answer()
 
 # ================== MAIN ==================
 async def on_startup(app: Application):
